@@ -1,0 +1,170 @@
+"""
+Détection de fraude financière par Machine Learning
+Règles métier contre Random Forest et XGBoost sur PaySim (PFE HESTIM, Imane Aghanim).
+
+Usage :
+    python fraude_paysim.py chemin/vers/paysim.csv            # tout (environ 10 minutes)
+    python fraude_paysim.py chemin/vers/paysim.csv --rapide   # sans les tests de robustesse
+
+Sortie : tableau comparatif affiché + fichier resultats.csv
+"""
+import argparse
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+from scipy.stats import binomtest
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import confusion_matrix
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
+from xgboost import XGBClassifier
+
+warnings.filterwarnings("ignore")
+
+SEED = 42
+N_LIGNES = 1_048_575            # échantillon du rapport : premières lignes du fichier
+COUT_FRAUDE_MANQUEE = 50_000    # MAD, hypothèse
+COUT_FAUSSE_ALERTE = 150        # MAD, hypothèse
+
+
+def charger(chemin):
+    """Charge PaySim, retire les numéros de compte, encode le type d'opération."""
+    with open(chemin, encoding="utf-8") as f:
+        ligne = f.readline()
+    sep = ";" if ligne.count(";") > ligne.count(",") else ","
+    df = pd.read_csv(chemin, sep=sep, nrows=N_LIGNES).drop_duplicates()
+    df = df.drop(columns=["nameOrig", "nameDest"])
+    df = pd.get_dummies(df, columns=["type"], drop_first=True)
+    return df.drop(columns="isFraud"), df["isFraud"]
+
+
+def bilan(nom, y_vrai, y_pred):
+    """Fraudes manquées / fausses alertes / précision / rappel / F1 / coût."""
+    tn, fp, fn, tp = confusion_matrix(y_vrai, y_pred, labels=[0, 1]).ravel()
+    return {
+        "Méthode": nom,
+        "Manquées (FN)": int(fn),
+        "Fausses alertes (FP)": int(fp),
+        "Trouvées (VP)": int(tp),
+        "Précision": round(tp / (tp + fp), 3) if tp + fp else 0.0,
+        "Rappel": round(tp / (tp + fn), 3),
+        "F1": round(2 * tp / (2 * tp + fp + fn), 3),
+        "Coût (MAD)": int(fn * COUT_FRAUDE_MANQUEE + fp * COUT_FAUSSE_ALERTE),
+    }
+
+
+def criteres(D):
+    """Les 6 critères de la règle métier (1 si le critère est vrai)."""
+    risque = (D["type_TRANSFER"] == 1) | (D["type_CASH_OUT"] == 1)
+    return pd.DataFrame({
+        "montant_eleve": D["amount"] > 200_000,
+        "compte_vide": (D["newbalanceOrig"] == 0) & (D["oldbalanceOrg"] > 0),
+        "type_a_risque": risque,
+        "destinataire_vide": D["oldbalanceDest"] == 0,
+        "solde_dest_non_credite": (D["oldbalanceDest"] + D["amount"] - D["newbalanceDest"]).abs() > 1,
+        "nuit": (D["step"] % 24) < 6,
+    }).astype(int)
+
+
+def choisir_k(Ctr, ytr):
+    """Seuil k de la règle : celui qui minimise le coût sur l'entraînement."""
+    couts = {k: bilan("", ytr, (Ctr.sum(axis=1) >= k).astype(int))["Coût (MAD)"] for k in range(1, 7)}
+    return min(couts, key=couts.get)
+
+
+def regler_xgboost(Xtr, ytr):
+    """8 combinaisons (profondeur 3 ou 6 x pondération 1, 10, 30, 918), CV 3 plis, F1, entraînement seul."""
+    ratio = round((ytr == 0).sum() / (ytr == 1).sum())
+    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED)
+    meilleur, meilleur_f1 = None, -1
+    for spw in [1, 10, 30, ratio]:
+        for prof in [3, 6]:
+            m = XGBClassifier(n_estimators=100, max_depth=prof, scale_pos_weight=spw, random_state=SEED,
+                              eval_metric="logloss", tree_method="hist", n_jobs=-1)
+            f1 = cross_val_score(m, Xtr, ytr, cv=cv, scoring="f1").mean()
+            if f1 > meilleur_f1:
+                meilleur, meilleur_f1 = {"max_depth": prof, "scale_pos_weight": spw}, f1
+    return meilleur
+
+
+def modele_rf():
+    return RandomForestClassifier(n_estimators=100, random_state=SEED, class_weight="balanced", n_jobs=-1)
+
+
+def modele_xgb(params):
+    return XGBClassifier(n_estimators=100, random_state=SEED, eval_metric="logloss",
+                         tree_method="hist", n_jobs=-1, **params)
+
+
+def robustesse(X, y, Xtr, ytr, y_rf, y_xgb, yte, params):
+    print("\n=== Validation croisée à 5 plis (F1, entraînement) ===")
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    for nom, m in [("Random Forest", modele_rf()),
+                   ("XGBoost par défaut", XGBClassifier(random_state=SEED, eval_metric="logloss", n_jobs=-1)),
+                   ("XGBoost réglé", modele_xgb(params))]:
+        s = cross_val_score(m, Xtr, ytr, cv=cv, scoring="f1")
+        print(f"{nom:20s} {np.round(s, 3)}  moyenne {s.mean():.3f}")
+
+    print("\n=== Cinq autres découpages (coût en MAD) ===")
+    moins_cher = 0
+    for graine in range(5):
+        A, B, ya, yb = train_test_split(X, y, test_size=0.3, random_state=graine, stratify=y)
+        c_rf = bilan("", yb, modele_rf().fit(A, ya).predict(B))["Coût (MAD)"]
+        c_xg = bilan("", yb, modele_xgb(params).fit(A, ya).predict(B))["Coût (MAD)"]
+        moins_cher += c_xg < c_rf
+        print(f"graine {graine} : RF {c_rf:,}  |  XGBoost réglé {c_xg:,}")
+    print(f"XGBoost réglé moins cher dans {moins_cher} / 5 découpages")
+
+    print("\n=== Test de McNemar (sur les fraudes) ===")
+    fr = yte.values == 1
+    seul_xgb = int(((y_xgb[fr] == 1) & (y_rf[fr] == 0)).sum())
+    seul_rf = int(((y_xgb[fr] == 0) & (y_rf[fr] == 1)).sum())
+    p = binomtest(seul_xgb, seul_xgb + seul_rf, 0.5).pvalue if seul_xgb + seul_rf else 1.0
+    print(f"trouvées seulement par XGBoost : {seul_xgb} | seulement par RF : {seul_rf} | p = {p:.2e}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("chemin", help="fichier CSV PaySim")
+    ap.add_argument("--rapide", action="store_true", help="saute les tests de robustesse")
+    args = ap.parse_args()
+    t0 = time.time()
+
+    X, y = charger(args.chemin)
+    print(f"Transactions : {len(X):,} | fraudes : {int(y.sum()):,} ({y.mean()*100:.2f} %)")
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=SEED, stratify=y)
+    print(f"Entraînement : {len(Xtr):,} | Test : {len(Xte):,} dont {int(yte.sum())} fraudes")
+
+    # Règle métier
+    k = choisir_k(criteres(Xtr), ytr)
+    y_regle = (criteres(Xte).sum(axis=1) >= k).astype(int).values
+    print(f"Règle : alerte si au moins {k} critères sur 6 (choisi sur l'entraînement)")
+
+    # Modèles
+    rf = modele_rf().fit(Xtr, ytr)
+    y_rf = (rf.predict_proba(Xte)[:, 1] >= 0.5).astype(int)
+    xgb_defaut = XGBClassifier(random_state=SEED, eval_metric="logloss", n_jobs=-1).fit(Xtr, ytr)
+    params = regler_xgboost(Xtr, ytr)
+    print("XGBoost réglé :", params)
+    xgb = modele_xgb(params).fit(Xtr, ytr)
+    y_xgb = (xgb.predict_proba(Xte)[:, 1] >= 0.5).astype(int)
+
+    final = pd.DataFrame([
+        bilan(f"Règle métier (>= {k} critères)", yte, y_regle),
+        bilan("Random Forest", yte, y_rf),
+        bilan("XGBoost par défaut", yte, xgb_defaut.predict(Xte)),
+        bilan("XGBoost réglé", yte, y_xgb),
+    ])
+    print("\n=== Comparaison finale (jeu de test) ===")
+    print(final.to_string(index=False))
+    final.to_csv("resultats.csv", index=False)
+    print("\nRésultats enregistrés dans resultats.csv")
+
+    if not args.rapide:
+        robustesse(X, y, Xtr, ytr, y_rf, y_xgb, yte, params)
+    print(f"\nTerminé en {time.time() - t0:.0f} s")
+
+
+if __name__ == "__main__":
+    main()
