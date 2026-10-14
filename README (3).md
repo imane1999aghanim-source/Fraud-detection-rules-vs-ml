@@ -46,7 +46,7 @@ Jeu de test : 314 573 transactions, dont 343 fraudes.
 - Les données ne sont pas incluses dans ce dépôt : télécharger PaySim séparément.
 - Nettoyage : suppression des numéros de compte, type d'opération encodé en chiffre, aucune valeur manquante.
 - Découpage stratifié : 70 % entraînement, 30 % test (`random_state=42`).
-
+  https://www.kaggle.com/datasets/mtalaltariq/paysim-data
 ## Méthodes comparées
 
 | Méthode | Principe | Paramètres |
